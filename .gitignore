@@ -141,3 +141,4 @@ spider2-lite/resource/databases/spider2-localdb
 credentials/
 **/credentials/
 
+.env

@@ -408,7 +408,7 @@ def evaluate_spider2sql(args, temp_dir: Path):
 
     root_dir = Path(__file__).resolve().parent.parent
     spider2sql_metadata = load_jsonl_to_dict(str(root_dir / "spider2-lite.jsonl"))
-    sqlite_base_dir = root_dir / "resource" / "databases"
+    sqlite_base_dir = root_dir / "resource" / "databases" / "spider2-localdb"
 
     result_csv_dir = None
     if mode == "sql":
