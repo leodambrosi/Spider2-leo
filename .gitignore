@@ -142,3 +142,4 @@ credentials/
 **/credentials/
 
 .env
+my_key.txt
