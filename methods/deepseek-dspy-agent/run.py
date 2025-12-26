@@ -71,10 +71,12 @@ def config() -> argparse.Namespace:
     parser.add_argument("--max_memory_length", type=int, default=10)
     parser.add_argument("--suffix", '-s', type=str, default="deepseek-dspy")
     parser.add_argument("--model", type=str, default="deepseek-reasoner")
-    parser.add_argument("--temperature", type=float, default=0.5)
+    parser.add_argument("--temperature", type=float, default=1.0)
     parser.add_argument("--top_p", type=float, default=0.9)
     parser.add_argument("--max_tokens", type=int, default=2000)
     parser.add_argument("--stop_token", type=str, default=None)
+    parser.add_argument("--thinking", action="store_true", help="Enable thinking mode for deepseek-chat")
+    parser.add_argument("--json_mode", action="store_true", help="Enable strict JSON mode (deepseek-chat only)")
 
     # DSPy/GEPA parameters
     parser.add_argument("--use_gepa", action="store_true", default=False, help="Use GEPA optimization (experimental, minimal optimization)")
@@ -214,12 +216,16 @@ def test(args: argparse.Namespace) -> None:
         }
 
         source_data_dir = os.path.dirname(args.test_path)
-        task_config['config'] = [{
-            "type": "copy_all_subfiles",
-            "parameters": {
-                "dirs": [os.path.join(source_data_dir, instance_id)]
-            }
-        }]
+        instance_data_dir = os.path.join(source_data_dir, instance_id)
+        if os.path.exists(instance_data_dir):
+            task_config['config'] = [{
+                "type": "copy_all_subfiles",
+                "parameters": {
+                    "dirs": [instance_data_dir]
+                }
+            }]
+        else:
+            task_config['config'] = []
 
         # Create environment
         env = Spider_Agent_Env(
@@ -239,7 +245,9 @@ def test(args: argparse.Namespace) -> None:
             max_steps=args.max_steps,
             use_plan=args.plan,
             use_gepa=args.use_gepa,
-            gepa_iterations=args.gepa_iterations
+            gepa_iterations=args.gepa_iterations,
+            thinking=args.thinking,
+            json_mode=args.json_mode
         )
 
         agent.set_env_and_task(env)

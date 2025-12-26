@@ -6,9 +6,12 @@ GEPA uses genetic algorithms to evolve and optimize prompt programs.
 """
 
 import random
+import logging
 from typing import List, Tuple, Callable, Optional, Dict, Any
 import dspy
 from dspy.teleprompt import Teleprompter
+
+logger = logging.getLogger("deepseek_dspy_agent")
 
 
 class GEPAOptimizer(Teleprompter):
@@ -110,23 +113,20 @@ class GEPAOptimizer(Teleprompter):
                         field.desc = self._mutate_text(field.desc)
 
         # Mutate demonstrations if available
-        if hasattr(program, 'demonstrations') and random.random() < mutation_rate:
-            demos = program.demonstrations
-            if demos and len(demos) > 0:
-                # Randomly modify one demonstration
-                idx = random.randint(0, len(demos) - 1)
-                demo = demos[idx]
-                # Simple mutation: could modify demo attributes
-                # For now, just mark as modified (placeholder)
-                # In practice, would mutate demo inputs/outputs
-                pass
-
-        # Mutate demos attribute (common in DSPy)
-        if hasattr(program, 'demos') and random.random() < mutation_rate:
-            demos = program.demos
-            if demos and len(demos) > 0:
-                # Similar to above
-                pass
+        for attr in ['demonstrations', 'demos']:
+            if hasattr(program, attr) and random.random() < mutation_rate:
+                demos = getattr(program, attr)
+                if demos and len(demos) > 0:
+                    mutation_type = random.choice(['shuffle', 'remove', 'duplicate'])
+                    if mutation_type == 'shuffle':
+                        random.shuffle(demos)
+                    elif mutation_type == 'remove' and len(demos) > 1:
+                        idx = random.randint(0, len(demos) - 1)
+                        demos.pop(idx)
+                    elif mutation_type == 'duplicate' and len(demos) < 10:
+                        idx = random.randint(0, len(demos) - 1)
+                        demos.insert(idx, demos[idx].copy())
+                setattr(program, attr, demos)
 
         return program
 
@@ -149,15 +149,19 @@ class GEPAOptimizer(Teleprompter):
                     if random.random() < 0.3:  # 30% chance to copy field description
                         child_field.desc = parent2.signature.fields[field_name].desc
 
-        # Crossover demonstrations
-        if hasattr(parent1, 'demonstrations') and hasattr(parent2, 'demonstrations'):
-            if parent2.demonstrations and random.random() < 0.5:
-                child.demonstrations = parent2.demonstrations.copy()
-
-        # Crossover demos (common attribute name)
-        if hasattr(parent1, 'demos') and hasattr(parent2, 'demos'):
-            if parent2.demos and random.random() < 0.5:
-                child.demos = parent2.demos.copy()
+        # Crossover demonstrations/demos
+        for attr in ['demonstrations', 'demos']:
+            if hasattr(parent1, attr) and hasattr(parent2, attr):
+                p1_demos = getattr(parent1, attr)
+                p2_demos = getattr(parent2, attr)
+                if p1_demos and p2_demos:
+                    if random.random() < 0.5:
+                        # Simple swap
+                        setattr(child, attr, p2_demos.copy())
+                    else:
+                        # Mix demonstrations
+                        mixed = p1_demos[:len(p1_demos)//2] + p2_demos[len(p2_demos)//2:]
+                        setattr(child, attr, mixed)
 
         return child
 
@@ -246,7 +250,7 @@ class GEPAOptimizer(Teleprompter):
 
             # Log best fitness
             best_score = evaluated[0][1]
-            print(f"Generation {generation + 1}/{self.generations}, Best fitness: {best_score:.3f}")
+            logger.info(f"Generation {generation + 1}/{self.generations}, Best fitness: {best_score:.3f}")
 
         # Return best program
         final_evaluated = self._evaluate_population(population, trainset)

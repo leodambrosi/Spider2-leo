@@ -93,20 +93,35 @@ class ActionParser:
         self.available_action_classes = available_action_classes
 
     def parse(self, action_text: str):
-        """Parse action text into Action object."""
+        """Parse action text into Action object, prioritizing JSON."""
         if not action_text:
             return None
 
-        # Try to match action patterns
+        # 1. Try to parse as a direct JSON object
+        try:
+            # Handle potential markdown code blocks first
+            json_text = action_text
+            if "```" in action_text:
+                matches = re.findall(r"```(?:json)?\n?([\s\S]*?)```", action_text)
+                if matches:
+                    json_text = matches[-1].strip()
+            
+            data = json.loads(json_text)
+            if isinstance(data, dict) and "action" in data:
+                action_candidate = data["action"]
+                # Try to parse the action string from JSON
+                for action_cls in self.available_action_classes:
+                    action = action_cls.parse_action_from_text(action_candidate)
+                    if action is not None:
+                        return action
+        except (json.JSONDecodeError, TypeError):
+            pass
+
+        # 2. Fallback: Search for action patterns in the raw text
+        # This handles cases where the model ignores the JSON instruction 
+        # but still outputs a valid ActionName(...) string.
         for action_cls in self.available_action_classes:
             action = action_cls.parse_action_from_text(action_text)
-            if action is not None:
-                return action
-
-        # Try with cleaned text
-        cleaned_text = action_text.replace("\\_", "_").replace("'''", "```")
-        for action_cls in self.available_action_classes:
-            action = action_cls.parse_action_from_text(cleaned_text)
             if action is not None:
                 return action
 
@@ -200,22 +215,28 @@ class DeepSeekClient:
         }
 
     def chat_completion(self, messages: list, **override_kwargs) -> dict:
-        """Make chat completion request to DeepSeek API.
-
-        Returns:
-            dict with keys:
-            - 'content': The final message content
-            - 'reasoning_content': Reasoning content (for R1 models), may be None
-        """
+        """Make chat completion request to DeepSeek API."""
         combined_kwargs = {**self.kwargs, **override_kwargs}
+        
+        # Handle JSON mode if requested
+        response_format = combined_kwargs.pop('response_format', None)
+        extra_body = combined_kwargs.pop('extra_body', None)
 
         try:
             logger.debug(f"DeepSeek API request: model={self.model}, messages={messages}")
-            response = self.client.chat.completions.create(
-                model=self.model,
-                messages=messages,
+            
+            # Construct parameters for the OpenAI client
+            params = {
+                "model": self.model,
+                "messages": messages,
                 **combined_kwargs
-            )
+            }
+            if response_format:
+                params["response_format"] = response_format
+            if extra_body:
+                params["extra_body"] = extra_body
+
+            response = self.client.chat.completions.create(**params)
 
             message = response.choices[0].message
             content = message.content
@@ -342,7 +363,19 @@ class DeepSeekReasonerLM(dspy.LM):
 
 
 class ThoughtActionSignature(dspy.Signature):
-    """Generate thought and action based on observation, history, and instruction."""
+    """
+    Reason about the next step and provide a structured response.
+    
+    You must output your response as a JSON object with two keys:
+    1. "thought": Your reasoning about what to do next.
+    2. "action": The action to take, formatted exactly as ActionName(parameter='value').
+    
+    Example Output:
+    {
+        "thought": "I need to check the tables in the database.",
+        "action": "LOCAL_DB_SQL(query='SELECT name FROM sqlite_master')"
+    }
+    """
     observation = dspy.InputField(desc="Current observation from environment")
     history = dspy.InputField(desc="Recent interaction history")
     instruction = dspy.InputField(desc="Original task instruction")
@@ -364,39 +397,29 @@ class DeepSeekDSPyAgent:
         max_steps: int = 15,
         use_plan: bool = False,
         use_gepa: bool = False,
-        gepa_iterations: int = 10
+        gepa_iterations: int = 10,
+        thinking: bool = False,
+        json_mode: bool = False
     ):
         # Set up DeepSeek LM
         api_key = api_key or os.environ.get("DEEPSEEK_API_KEY")
         if not api_key:
             raise ValueError("DEEPSEEK_API_KEY environment variable not set")
 
-        # Validate parameters
-        if not model or not isinstance(model, str):
-            raise ConfigurationError(f"Invalid model: {model}")
-        if not isinstance(max_tokens, int) or max_tokens <= 0:
-            raise ConfigurationError(f"max_tokens must be positive integer, got {max_tokens}")
-        if not (0.0 <= top_p <= 1.0):
-            raise ConfigurationError(f"top_p must be between 0.0 and 1.0, got {top_p}")
-        if not (0.0 <= temperature <= 2.0):
-            raise ConfigurationError(f"temperature must be between 0.0 and 2.0, got {temperature}")
-        if not isinstance(max_memory_length, int) or max_memory_length <= 0:
-            raise ConfigurationError(f"max_memory_length must be positive integer, got {max_memory_length}")
-        if not isinstance(max_steps, int) or max_steps <= 0:
-            raise ConfigurationError(f"max_steps must be positive integer, got {max_steps}")
-        if not isinstance(gepa_iterations, int) or gepa_iterations <= 0:
-            raise ConfigurationError(f"gepa_iterations must be positive integer, got {gepa_iterations}")
-        if not isinstance(use_gepa, bool):
-            raise ConfigurationError(f"use_gepa must be boolean, got {use_gepa}")
-        if not isinstance(use_plan, bool):
-            raise ConfigurationError(f"use_plan must be boolean, got {use_plan}")
+        # Configure extra parameters for thinking and JSON mode
+        extra_kwargs = {}
+        if thinking:
+            extra_kwargs["extra_body"] = {"thinking": {"type": "enabled"}}
+        if json_mode:
+            extra_kwargs["response_format"] = {"type": "json_object"}
 
         self.lm = DeepSeekReasonerLM(
             api_key=api_key,
             model=model,
             max_tokens=max_tokens,
             temperature=temperature,
-            top_p=top_p
+            top_p=top_p,
+            **extra_kwargs
         )
 
         # Configure DSPy
@@ -449,10 +472,31 @@ class DeepSeekDSPyAgent:
 
     def _evaluate_response(self, example, pred, trace=None):
         """Evaluate response for optimization."""
-        # Simple evaluation: check if action parsed successfully
+        # Check if action parsed successfully
         try:
             action = self.action_parser.parse(pred.action)
-            return 1.0 if action is not None else 0.0
+            if action is None:
+                return 0.0
+            
+            score = 1.0
+            
+            # Bonus for appropriate action types based on task type
+            if self.env:
+                task_type = self.env.task_config.get('type', 'Local')
+                action_type = type(action).__name__
+                
+                if task_type == 'Bigquery' and 'BIGQUERY' in action_type:
+                    score += 0.5
+                elif task_type == 'Snowflake' and 'SNOWFLAKE' in action_type:
+                    score += 0.5
+                elif task_type in ['Local', 'DBT'] and 'SQL' in action_type:
+                    score += 0.5
+            
+            # Penalize excessively long actions (likely hallucinations or messy output)
+            if len(pred.action) > 1000:
+                score -= 0.5
+                
+            return max(0.0, score)
         except Exception:
             return 0.0
 
@@ -649,6 +693,8 @@ class DeepSeekDSPyAgent:
         # Use reasoning content if available (DeepSeek R1)
         if self.lm.last_reasoning_content:
             thought = self.lm.last_reasoning_content
+            # Clear it after use to avoid accidental reuse
+            self.lm.last_reasoning_content = None
             logger.debug("Using DeepSeek R1 reasoning content for thought")
         else:
             thought = result.thought
